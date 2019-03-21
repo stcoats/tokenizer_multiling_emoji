@@ -1,4 +1,5 @@
 #tokenizer borrows from nltk, emojipy, jie_ba_tokenizer, and TinySegmenter
+#much borrowed from https://github.com/erikavaris/tokenizer/blob/master/tokenizer/tokenizer.py
 import nltk
 from nltk.tokenize.casual import remove_handles, reduce_lengthening, _str_to_unicode, _replace_html_entities # EMOTICONS, EMOTICON_RE
 import emojipy
@@ -7,8 +8,31 @@ import re
 from .reg import Regularizer
 import unicodedata
 import pkg_resources
+import regex
+import itertools
+import collections
+import tinysegmenter
+import html
+import re
+import emojipy
+from  emojipy.ruleset import unicode_replace
 
-EMOTICONS_FILE = pkg_resources.resource_filename('tokenizer', 'data/emoticons.txt')
+ascii = False
+unicode_alt = True
+sprites = False
+image_png_path = 'https://cdn.jsdelivr.net/emojione/assets/3.1/png/64/'
+ignored_regexp = '<object[^>]*>.*?<\/object>|<span[^>]*>.*?<\/span>|<(?:object|embed|svg|img|div|span|p|a)[^>]*>'
+unicode_regexp = "(" + '|'.join([re.escape(x.decode("utf-8")) for x in sorted(unicode_replace.keys(), key=len, reverse=True)]) + ")"
+shortcode_regexp = ':([-+\\w]+):'
+ascii_regexp = '(\\<3|&lt;3|\\<\\/3|&lt;\\/3|\\:\'\\)|\\:\'\\-\\)|\\:D|\\:\\-D|\\=D|\\:\\)|\\:\\-\\)|\\=\\]|\\=\\)|\\:\\]|\'\\:\\)|\'\\:\\-\\)|\'\\=\\)|\'\\:D|\'\\:\\-D|\'\\=D|\\>\\:\\)|&gt;\\:\\)|\\>;\\)|&gt;;\\)|\\>\\:\\-\\)|&gt;\\:\\-\\)|\\>\\=\\)|&gt;\\=\\)|;\\)|;\\-\\)|\\*\\-\\)|\\*\\)|;\\-\\]|;\\]|;D|;\\^\\)|\'\\:\\(|\'\\:\\-\\(|\'\\=\\(|\\:\\*|\\:\\-\\*|\\=\\*|\\:\\^\\*|\\>\\:P|&gt;\\:P|X\\-P|x\\-p|\\>\\:\\[|&gt;\\:\\[|\\:\\-\\(|\\:\\(|\\:\\-\\[|\\:\\[|\\=\\(|\\>\\:\\(|&gt;\\:\\(|\\>\\:\\-\\(|&gt;\\:\\-\\(|\\:@|\\:\'\\(|\\:\'\\-\\(|;\\(|;\\-\\(|\\>\\.\\<|&gt;\\.&lt;|\\:\\$|\\=\\$|#\\-\\)|#\\)|%\\-\\)|%\\)|X\\)|X\\-\\)|\\*\\\\0\\/\\*|\\\\0\\/|\\*\\\\O\\/\\*|\\\\O\\/|O\\:\\-\\)|0\\:\\-3|0\\:3|0\\:\\-\\)|0\\:\\)|0;\\^\\)|O\\:\\-\\)|O\\:\\)|O;\\-\\)|O\\=\\)|0;\\-\\)|O\\:\\-3|O\\:3|B\\-\\)|B\\)|8\\)|8\\-\\)|B\\-D|8\\-D|\\-_\\-|\\-__\\-|\\-___\\-|\\>\\:\\\\|&gt;\\:\\\\|\\>\\:\\/|&gt;\\:\\/|\\:\\-\\/|\\:\\-\\.|\\:\\/|\\:\\\\|\\=\\/|\\=\\\\|\\:L|\\=L|\\:P|\\:\\-P|\\=P|\\:\\-p|\\:p|\\=p|\\:\\-Þ|\\:\\-&THORN;|\\:Þ|\\:&THORN;|\\:þ|\\:&thorn;|\\:\\-þ|\\:\\-&thorn;|\\:\\-b|\\:b|d\\:|\\:\\-O|\\:O|\\:\\-o|\\:o|O_O|\\>\\:O|&gt;\\:O|\\:\\-X|\\:X|\\:\\-#|\\:#|\\=X|\\=x|\\:x|\\:\\-x|\\=#)'
+shortcode_compiled = re.compile(ignored_regexp+"|("+shortcode_regexp+")",
+                                    re.IGNORECASE)
+unicode_compiled = re.compile(ignored_regexp+"|("+unicode_regexp+")",
+                                  re.UNICODE)
+ascii_compiled = re.compile(ignored_regexp+"|("+ascii_regexp+")",
+                                re.IGNORECASE)
+
+EMOTICONS_FILE = ('emoticons.txt') #put your emoticons file here
 
 #urls - nltk version
 URLS = r"""         # Capture 1: entire matched URL
@@ -65,10 +89,6 @@ with open(EMOTICONS_FILE, 'r') as f:
         item = re.escape(item)
         EMOTICONS.append(item)
 
-#emojis, from emojione 3.1 (emojipy)
-EMOJIS=[re.escape(x.decode("utf-8")) for x in sorted(unicode_replace.keys(), key=len, reverse=True)]
-del EMOJIS[-12:] #for some reason digits 0-9, asterisk and hashtag were in their list of emojis
-
 # Twitter specific:
 HASHTAG = r"""(?:\#\w+)"""
 TWITTER_USER = r"""(?:@\w+)"""
@@ -111,125 +131,48 @@ TWITTER_REGEXPS = [URLS, PHONE] + EMOJIS + EMOTICONS + [HTML_TAGS, ASCII_ARROWS,
 
 REDDIT_REGEXPS = [URLS, PHONE] + EMOJIS + EMOTICONS + [HTML_TAGS, ASCII_ARROWS, REDDIT_USER, HASHTAG, EMAILS, WORDS]
 
-class TweetTokenizer():
+WORD_RE = re.compile(r"""(%s)""" % "|".join(TWITTER_REGEXPS), re.VERBOSE | re.I | re.UNICODE) # add REDDIT_REGEXPS as necessary
 
-    def __init__(self, preserve_case=True, preserve_handles=True, preserve_hashes=True, regularize=False, preserve_len=True, preserve_emoji=True, preserve_url=True):
-        ''' Tweet tokenizer with options:
-        ::param preserve_case:: if False, reduces text to lower case. Default True,
-        leaves case intact.
-        ::type preserve_case:: bool
-        ::param preserve_handles:: if False, strips Twitter user handles from text. Default True,
-        leaves user handles intact.
-        ::type preserve_handles:: bool
-        ::param preserve_hashes:: if False, strips the hash symbol from hashtags (but
-        does not delete the hashtag word). Default True, leaves hashtags intact.
-        ::type preserve_hashes:: bool
-        ::param regularize:: if True, regularizes the text for common English contractions,
-        resulting in two word sequences like "can" "not" instead of single token "can't".
-        Default False, does not regularize.
-        ::type regularize:: bool
-        ::param preserve_len:: if False, reduces three or more sequences of the same character
-        down to only three repetitions. Default True, does not reduce lengthening.
-        ::type preserve_len:: bool
-        ::param preserve_emoji:: if False, strips emoji from the text. Default True,
-        leaves emoji intact.
-        ::type preserve_emoji:: bool
-        ::param preserve_url:: if False, strips url addresses from the text. Default True,
-        leaves urls intact.
-        type preserve_url:: bool
-        '''
-        self.preserve_case = preserve_case
-        self.preserve_handles = preserve_handles
-        self.preserve_hashes = preserve_hashes
-        self.regularize = regularize
-        if self.regularize:
-            self.R = Regularizer()
+def tokenize2(text):
+  words = list(map((lambda x : x if EMOTICON_RE.search(x) or unicode_compiled.findall(x) else x.lower()), words))
+  return words
 
-        self.preserve_len = preserve_len
-        self.preserve_emoji = preserve_emoji
-        self.preserve_url = preserve_url
-        self.WORD_RE = re.compile(r"""(%s)""" % "|".join(TWITTER_REGEXPS), re.VERBOSE | re.I | re.UNICODE)
+segmenter = tinysegmenter.TinySegmenter()
+from chinese_tokenizer.tokenizer import Tokenizer
+jie_ba_tokenizer = Tokenizer().jie_ba_tokenizer
 
-    def strip_emoji(self, text):
-        '''Take out emoji. Returns doc string.
-        ::param text:: tweet
-        ::type doc:: str
-        '''
-        text = ''.join(c for c in text if unicodedata.category(c) != 'So') # almost works perfectly
-        return text
+def new_tokenize(row):
+    line = row["text"]
+    tokens = tokenize2(line)
+    return(tokens)
 
-    def tokenize(self, text):
-        '''Casual speech tokenizer wrapper function, closely based on nltk's version.
-        Returns a list of words.
-        ::param text:: tweet text
-        ::type text:: str
-        '''
-        text = _replace_html_entities(text)
-        if not self.preserve_handles:
-            text = re.sub(TWITTER_USER_RE, ' ', text)
-        if not self.preserve_hashes:
-            text = re.sub(HASH_RE, '', text)
-        if not self.preserve_url:
-            text = re.sub(URL_RE, ' ', text)
-        if not self.preserve_len:
-            text = reduce_lengthening(text)
-        if self.regularize:
-            text = self.R.regularize(text)
-        if not self.preserve_emoji:
-            text = self.strip_emoji(text)
-        words = self.WORD_RE.findall(text)
-        if not self.preserve_case:
-            words = list(map((lambda x : x if EMOTICON_RE.search(x) else
-                              x.lower()), words))
-        return words
-
-class RedditTokenizer():
-
-    def __init__(self, preserve_case=True, preserve_handles=True, preserve_hashes=True, regularize=False, preserve_len=True, preserve_emoji=True, preserve_url=True):
-
-        self.preserve_case = preserve_case
-        self.preserve_handles = preserve_handles
-        self.preserve_hashes = preserve_hashes
-        self.regularize = regularize
-        if self.regularize:
-            self.R = reg.Regularizer()
-
-        self.preserve_len = preserve_len
-        self.preserve_emoji = preserve_emoji
-        self.preserve_url = preserve_url
-        self.WORD_RE = re.compile(r"""(%s)""" % "|".join(REDDIT_REGEXPS), re.VERBOSE | re.I | re.UNICODE)
-
-    def strip_emoji(self, text):
-        '''Take out emoji. Returns doc string.
-        ::param text:: tweet
-        ::type doc:: str
-        '''
-        text = ''.join(c for c in text if unicodedata.category(c) != 'So') # almost works perfectly
-        return text
-
-    def tokenize(self, text):
-        '''Casual speech tokenizer wrapper function for Reddit, closely based on nltk's version.
-        Returns a list of words.
-        ::param text:: reddit text
-        ::type text:: str
-        '''
-        text = _replace_html_entities(text)
-        if not self.preserve_handles:
-            text = re.sub(REDDIT_USER_RE, ' ', text)
-        if not self.preserve_hashes:
-            text = re.sub(HASH_RE, '', text)
-        if not self.preserve_url:
-            text = re.sub(URL_RE, ' ', text)
-        if not self.preserve_len:
-            text = reduce_lengthening(text)
-        if self.regularize:
-            text = self.R.regularize(text)
-        if not self.preserve_emoji:
-            text = self.strip_emoji(text)
-        words = self.WORD_RE.findall(text)
-        if not self.preserve_case:
-            words = list(map((lambda x : x if EMOTICON_RE.search(x) else
-                              x.lower()), words))
-        return words
-
-
+def flatten(l):
+    for el in l:
+        if isinstance(el, collections.Iterable) and not isinstance(el, (str, bytes)):
+            yield from flatten(el)
+        else:
+            yield el
+            
+def tknz1(row):
+    line = row["text"]
+    line = html.unescape(line)
+    line = line.replace('\n','')
+    line = line.replace('\t','')
+    if row["lang"]=="ja":
+        tokens = tokenize2(line)
+        for i,x in enumerate(tokens):
+            if  regex.findall("\p{Hiragana}|\p{Katakana}|\p{Han}",x):
+                tokens[i] = segmenter.tokenize(x)
+        return [x for x in flatten(tokens)]
+        #tokens = segmenter.tokenize(line)
+        #return tokens
+    elif row["lang"]=="zh":
+        tokens = tokenize2(line)
+        for i,x in enumerate(tokens):
+            if  regex.findall("\p{Han}",x):
+                tokens[i] = segmenter.tokenize(x)
+        return [x for x in flatten(tokens)]
+    else:  
+        tokens = line.lower()
+        tokens  = tokenize2(line)
+        return tokens
